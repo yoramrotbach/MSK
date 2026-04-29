@@ -1,5 +1,85 @@
 import numpy as np
 
+# ── Convolutional FEC: rate 1/2, constraint length K=7 ───────────────────────
+# Generator polynomials (octal 133 / 171), standard NASA/MIL-STD-188-110 code.
+_K  = 7
+_G0 = 0b1011011   # octal 133
+_G1 = 0b1111001   # octal 171
+
+
+def conv_encode(bits):
+    """Rate 1/2, K=7 convolutional encoder. Appends K-1 flush zeros."""
+    sr = 0   # 6-bit shift-register state
+    out = []
+    for bit in list(bits) + [0] * (_K - 1):
+        full_sr = (bit << (_K - 1)) | sr
+        c0 = bin(full_sr & _G0).count('1') % 2
+        c1 = bin(full_sr & _G1).count('1') % 2
+        out += [c0, c1]
+        sr = full_sr >> 1
+    return out
+
+
+def viterbi_decode(received, n_data_bits):
+    """Hard-decision Viterbi decoder for the rate 1/2, K=7 code."""
+    n_states = 1 << (_K - 1)   # 64
+    INF      = 10 ** 9
+    n_steps  = len(received) // 2
+
+    # Precompute (next_state, c0, c1) for every (state, input) pair
+    trans = []
+    for s in range(n_states):
+        row = []
+        for b in range(2):
+            full_sr = (b << (_K - 1)) | s
+            c0 = bin(full_sr & _G0).count('1') % 2
+            c1 = bin(full_sr & _G1).count('1') % 2
+            row.append((full_sr >> 1, c0, c1))
+        trans.append(row)
+
+    pm = [INF] * n_states
+    pm[0] = 0
+    tb_state = [[-1] * n_states for _ in range(n_steps)]
+    tb_bit   = [[0]  * n_states for _ in range(n_steps)]
+
+    for t in range(n_steps):
+        r0, r1  = received[2 * t], received[2 * t + 1]
+        new_pm  = [INF] * n_states
+        for s in range(n_states):
+            if pm[s] == INF:
+                continue
+            for b in range(2):
+                ns, c0, c1 = trans[s][b]
+                cost = pm[s] + int(r0 != c0) + int(r1 != c1)
+                if cost < new_pm[ns]:
+                    new_pm[ns]    = cost
+                    tb_state[t][ns] = s
+                    tb_bit[t][ns]   = b
+        pm = new_pm
+
+    state    = int(np.argmin(pm))
+    bits_rev = []
+    for t in range(n_steps - 1, -1, -1):
+        bits_rev.append(tb_bit[t][state])
+        state = tb_state[t][state]
+    bits_rev.reverse()
+    return bits_rev[:n_data_bits]
+
+
+# ── LFSR scrambler ────────────────────────────────────────────────────────────
+# 9-stage Fibonacci LFSR, polynomial x^9 + x^4 + 1.
+# Applying scramble twice with the same seed restores the original bits.
+
+def scramble(bits, seed=0x1FF):
+    """XOR bit stream with a 9-bit LFSR sequence (self-inverse)."""
+    state = seed & 0x1FF
+    out   = []
+    for bit in bits:
+        out.append(bit ^ (state & 1))
+        feedback = ((state >> 8) ^ (state >> 3)) & 1
+        state    = ((state >> 1) | (feedback << 8)) & 0x1FF
+    return out
+
 
 def msk_modulate(data, bit_rate, carrier_freq, sample_rate):
     """MSK modulation with continuous phase."""

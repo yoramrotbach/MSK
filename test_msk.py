@@ -9,7 +9,9 @@ or:
 
 import unittest
 import numpy as np
-from msk import msk_modulate, awgn, msk_demodulate, compute_ber, ber_vs_snr, iq_samples
+from msk import (msk_modulate, awgn, msk_demodulate, compute_ber, ber_vs_snr,
+                 iq_samples, conv_encode, viterbi_decode, scramble)
+from standards import STANDARDS
 
 # Shared default parameters used across tests
 BIT_RATE     = 1e3
@@ -318,6 +320,172 @@ class TestEndToEnd(unittest.TestCase):
         _, sig = msk_modulate(data, BIT_RATE, CARRIER_FREQ, SAMPLE_RATE)
         I, Q = iq_samples(sig, CARRIER_FREQ, SAMPLE_RATE, BIT_RATE)
         self.assertEqual(len(I), len(data))
+
+
+class TestScramble(unittest.TestCase):
+
+    def test_self_inverse(self):
+        bits = [1, 0, 1, 1, 0, 0, 1, 0, 1, 1]
+        self.assertEqual(scramble(scramble(bits)), bits)
+
+    def test_self_inverse_long(self):
+        rng = np.random.default_rng(5)
+        bits = rng.integers(0, 2, 200).tolist()
+        self.assertEqual(scramble(scramble(bits)), bits)
+
+    def test_output_length_unchanged(self):
+        bits = [1, 0, 1, 0, 1]
+        self.assertEqual(len(scramble(bits)), len(bits))
+
+    def test_different_seed_gives_different_output(self):
+        bits = [1, 1, 1, 1, 1, 1, 1, 1]
+        self.assertNotEqual(scramble(bits, seed=0x1FF), scramble(bits, seed=0x100))
+
+    def test_all_zeros_input_not_all_zeros_output(self):
+        bits = [0] * 20
+        out = scramble(bits)
+        self.assertFalse(all(b == 0 for b in out),
+                         "Scrambler should whiten a run of zeros")
+
+    def test_empty_input(self):
+        self.assertEqual(scramble([]), [])
+
+
+class TestConvCode(unittest.TestCase):
+
+    def test_output_length(self):
+        bits = [1, 0, 1, 1, 0]
+        # rate 1/2 + K-1=6 flush steps → (5+6)*2 = 22
+        self.assertEqual(len(conv_encode(bits)), (len(bits) + 6) * 2)
+
+    def test_all_zeros_encodes_to_all_zeros(self):
+        bits = [0] * 10
+        self.assertEqual(conv_encode(bits), [0] * ((10 + 6) * 2))
+
+    def test_roundtrip_short(self):
+        bits = [1, 0, 1]
+        encoded = conv_encode(bits)
+        decoded = viterbi_decode(encoded, len(bits))
+        self.assertEqual(decoded, bits)
+
+    def test_roundtrip_all_ones(self):
+        bits = [1] * 20
+        encoded = conv_encode(bits)
+        decoded = viterbi_decode(encoded, len(bits))
+        self.assertEqual(decoded, bits)
+
+    def test_roundtrip_alternating(self):
+        bits = [1, 0] * 15
+        encoded = conv_encode(bits)
+        decoded = viterbi_decode(encoded, len(bits))
+        self.assertEqual(decoded, bits)
+
+    def test_roundtrip_random(self):
+        rng = np.random.default_rng(42)
+        bits = rng.integers(0, 2, 100).tolist()
+        encoded = conv_encode(bits)
+        decoded = viterbi_decode(encoded, len(bits))
+        self.assertEqual(decoded, bits)
+
+    def test_single_bit_error_corrected(self):
+        bits = [1, 0, 1, 1, 0, 0, 1, 0]
+        encoded = conv_encode(bits)
+        # Flip one bit in the middle of the encoded stream
+        corrupted = encoded[:]
+        corrupted[len(encoded) // 2] ^= 1
+        decoded = viterbi_decode(corrupted, len(bits))
+        self.assertEqual(decoded, bits)
+
+    def test_viterbi_returns_correct_length(self):
+        bits = [1, 0, 1, 0, 1]
+        encoded = conv_encode(bits)
+        decoded = viterbi_decode(encoded, len(bits))
+        self.assertEqual(len(decoded), len(bits))
+
+
+class TestStandards(unittest.TestCase):
+
+    def test_mil_std_carrier(self):
+        self.assertEqual(STANDARDS["MIL-STD-188-110"]["carrier_freq"], 1500)
+
+    def test_stanag_carrier(self):
+        self.assertEqual(STANDARDS["STANAG-4285"]["carrier_freq"], 1800)
+
+    def test_both_standards_have_fec(self):
+        for std in STANDARDS.values():
+            self.assertTrue(std["use_fec"])
+
+    def test_both_standards_have_scrambler(self):
+        for std in STANDARDS.values():
+            self.assertTrue(std["use_scrambler"])
+
+    def test_valid_bit_rates_contain_300(self):
+        for std in STANDARDS.values():
+            self.assertIn(300, std["valid_bit_rates"])
+
+    def test_preamble_is_alternating(self):
+        for std in STANDARDS.values():
+            p = std["preamble"]
+            for i in range(len(p) - 1):
+                self.assertNotEqual(p[i], p[i + 1],
+                    msg="Preamble should alternate 1/0")
+
+
+class TestFullPipeline(unittest.TestCase):
+    """Encode text → WAV bits → decode text, verifying end-to-end correctness."""
+
+    def _roundtrip(self, text, standard_name):
+        from msk import msk_modulate, msk_demodulate
+
+        std      = STANDARDS[standard_name]
+        bit_rate = 300
+        carrier  = std["carrier_freq"]
+        sr       = std["sample_rate"]
+
+        # --- encode ---
+        data_bits   = []
+        for ch in text:
+            b = ord(ch)
+            for i in range(7, -1, -1):
+                data_bits.append((b >> i) & 1)
+        header = [(len(data_bits) >> (15 - i)) & 1 for i in range(16)]
+        payload = header + data_bits
+        if std["use_scrambler"]:
+            payload = scramble(payload, std["scrambler_seed"])
+        if std["use_fec"]:
+            payload = conv_encode(payload)
+        transmission = std["preamble"] + payload
+
+        _, signal = msk_modulate(transmission, bit_rate, carrier, sr)
+
+        # --- decode ---
+        all_bits   = msk_demodulate(signal, bit_rate, carrier, sr)
+        demod      = all_bits[len(std["preamble"]):]
+        if std["use_fec"]:
+            n_data = len(demod) // 2 - 6
+            demod = viterbi_decode(demod, n_data)
+        if std["use_scrambler"]:
+            demod = scramble(demod, std["scrambler_seed"])
+        n_text = sum(demod[i] << (15 - i) for i in range(16))
+        text_bits = demod[16: 16 + n_text]
+        chars = []
+        for i in range(0, len(text_bits) - (len(text_bits) % 8), 8):
+            byte = sum(text_bits[i + j] << (7 - j) for j in range(8))
+            if byte == 0x0A or (0x20 <= byte <= 0x7E):
+                chars.append(chr(byte))
+        return "".join(chars)
+
+    def test_mil_std_roundtrip(self):
+        text = "Hello, MIL-STD-188-110!"
+        self.assertEqual(self._roundtrip(text, "MIL-STD-188-110"), text)
+
+    def test_stanag_roundtrip(self):
+        text = "STANAG 4285 test message."
+        self.assertEqual(self._roundtrip(text, "STANAG-4285"), text)
+
+    def test_multiline_text(self):
+        text = "Line one.\nLine two.\nLine three."
+        self.assertEqual(self._roundtrip(text, "MIL-STD-188-110"), text)
 
 
 if __name__ == "__main__":

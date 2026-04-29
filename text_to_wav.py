@@ -1,68 +1,108 @@
 """
 Encode a text file as an MSK-modulated WAV audio file.
 
+Encoding chain:
+  text → bits → [16-bit length header | data bits]
+       → LFSR scramble
+       → rate 1/2 K=7 convolutional FEC
+       → preamble prepended
+       → MSK modulate → WAV
+
 Usage:
+    python text_to_wav.py input.txt
     python text_to_wav.py input.txt output.wav
-    python text_to_wav.py input.txt              # writes output.wav by default
-
-The resulting audio file can be played on any media player.
-You will hear two alternating tones (like a dial-up modem) encoding your text.
-
-Parameters are chosen so the tones sit comfortably in the audible range:
-  carrier : 1500 Hz  (centre tone)
-  bit rate: 300 bps  (slow enough to hear the frequency changes)
-  f_high  : 1650 Hz  (bit = 1)
-  f_low   : 1350 Hz  (bit = 0)
+    python text_to_wav.py input.txt output.wav --standard STANAG-4285
+    python text_to_wav.py input.txt output.wav --standard MIL-STD-188-110 --bit-rate 600
 """
 
-import sys
 import argparse
 import numpy as np
 import scipy.io.wavfile as wavfile
-from msk import msk_modulate
-
-SAMPLE_RATE  = 44100   # Hz  — standard audio quality
-CARRIER_FREQ = 1500    # Hz
-BIT_RATE     = 300     # bps — slow enough to hear individual tone shifts
+from msk import msk_modulate, conv_encode, scramble
+from standards import STANDARDS, DEFAULT_STANDARD, VALID_BIT_RATES
 
 
 def text_to_bits(text):
     bits = []
-    for char in text:
-        byte = ord(char)
-        for i in range(7, -1, -1):       # MSB first
-            bits.append((byte >> i) & 1)
+    for ch in text:
+        b = ord(ch)
+        for i in range(7, -1, -1):
+            bits.append((b >> i) & 1)
     return bits
 
 
-def encode(input_path, output_path):
+def int_to_bits(n, width=16):
+    return [(n >> (width - 1 - i)) & 1 for i in range(width)]
+
+
+def encode(input_path, output_path, standard_name, bit_rate):
+    std = STANDARDS[standard_name]
+
+    if bit_rate not in std["valid_bit_rates"]:
+        raise ValueError(
+            f"{bit_rate} bps is not valid for {standard_name}. "
+            f"Choose from: {std['valid_bit_rates']}"
+        )
+
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
-
     if not text:
         print("Input file is empty.")
         return
 
-    bits = text_to_bits(text)
-    _, signal = msk_modulate(bits, BIT_RATE, CARRIER_FREQ, SAMPLE_RATE)
+    data_bits   = text_to_bits(text)
+    header_bits = int_to_bits(len(data_bits), 16)   # 16-bit length field
+    payload     = header_bits + data_bits
 
-    # Normalise to full 16-bit PCM range
+    if std["use_scrambler"]:
+        payload = scramble(payload, std["scrambler_seed"])
+
+    if std["use_fec"]:
+        payload = conv_encode(payload)                # doubles bit count + K-1 flush
+
+    transmission = std["preamble"] + payload
+
+    carrier     = std["carrier_freq"]
+    sample_rate = std["sample_rate"]
+    _, signal   = msk_modulate(transmission, bit_rate, carrier, sample_rate)
+
     pcm = np.int16(signal / np.max(np.abs(signal)) * 32767)
-    wavfile.write(output_path, SAMPLE_RATE, pcm)
+    wavfile.write(output_path, sample_rate, pcm)
 
-    duration = len(bits) / BIT_RATE
-    print(f"Input    : {input_path}  ({len(text)} characters, {len(bits)} bits)")
+    n_fec = len(payload) if std["use_fec"] else 0
+    duration = len(transmission) / bit_rate
+    f_high = carrier + bit_rate // 2
+    f_low  = carrier - bit_rate // 2
+
+    print(f"Standard : {standard_name}")
+    print(f"Input    : {input_path}  ({len(text)} chars, {len(data_bits)} data bits)")
+    print(f"FEC      : {'on — ' + str(len(data_bits) + 16) + ' payload bits → ' + str(n_fec) + ' encoded bits' if std['use_fec'] else 'off'}")
+    print(f"Scrambler: {'on' if std['use_scrambler'] else 'off'}")
+    print(f"Preamble : {len(std['preamble'])} bits")
     print(f"Output   : {output_path}")
-    print(f"Duration : {duration:.2f} s  at {BIT_RATE} bps")
-    print(f"Carrier  : {CARRIER_FREQ} Hz   |  f_high={CARRIER_FREQ + BIT_RATE//2} Hz  f_low={CARRIER_FREQ - BIT_RATE//2} Hz")
+    print(f"Duration : {duration:.2f} s  at {bit_rate} bps")
+    print(f"Carrier  : {carrier} Hz  |  f_high={f_high} Hz  f_low={f_low} Hz")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Encode a text file as an MSK audio signal.")
-    parser.add_argument("input",  help="Path to the input text file")
-    parser.add_argument("output", nargs="?", default="output.wav", help="Path for the output WAV file (default: output.wav)")
+    parser = argparse.ArgumentParser(
+        description="Encode a text file as a standard-compliant MSK audio signal."
+    )
+    parser.add_argument("input",  help="Input text file")
+    parser.add_argument("output", nargs="?", default="output.wav", help="Output WAV file (default: output.wav)")
+    parser.add_argument(
+        "--standard", default=DEFAULT_STANDARD,
+        choices=list(STANDARDS.keys()),
+        help=f"Waveform standard (default: {DEFAULT_STANDARD})"
+    )
+    parser.add_argument(
+        "--bit-rate", type=int, default=None,
+        help=f"Bit rate in bps. Valid values: {VALID_BIT_RATES} (default: standard's default)"
+    )
     args = parser.parse_args()
-    encode(args.input, args.output)
+
+    bit_rate = args.bit_rate or STANDARDS[args.standard]["default_bit_rate"]
+    encode(args.input, args.output, args.standard, bit_rate)
 
 
 if __name__ == "__main__":
