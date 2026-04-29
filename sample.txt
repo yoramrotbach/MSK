@@ -1,0 +1,4 @@
+Hello from MSK!
+This text has been converted to an audio signal using Minimum Shift Keying modulation.
+Each character is encoded as 8 bits, transmitted at 300 bps on a 1500 Hz carrier.
+You are hearing two tones at 1350 Hz and 1650 Hz alternating to represent 0s and 1s.
