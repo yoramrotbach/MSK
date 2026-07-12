@@ -7,3 +7,9 @@ generate_docs.js
 text
 text2
 ~$*
+.DS_Store
+*.wav
+decoded.txt
+input.txt
+out.txt
+recovered.txt
